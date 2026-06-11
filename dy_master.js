@@ -13,6 +13,16 @@ m.httpGet = function(url, t) {
   });
 };
 
+m.httpGetWithRetry = async function(url, t, retries) {
+  t = t || 10000; retries = retries || 2;
+  for (var i=0; i<=retries; i++) {
+    var r = await m.httpGet(url, t);
+    if (!r.e) return r;
+    if (i < retries) console.log('[retry] attempt '+(i+1)+' failed: '+r.e);
+  }
+  return r;
+};
+
 m.getSecId = function(c) {
   var p = c.charAt(0);
   return (p==='6'||p==='9') ? '1.'+c : '0.'+c;
@@ -139,14 +149,19 @@ m.runDeep = async function(picks, cfg) {
 
 m.analyzeMarket = async function() {
   try {
-    // 1. 指数行情
-    var idxs = [{n:'sh',s:'1.000001'},{n:'sz',s:'0.399001'},{n:'cy',s:'0.399006'}];
-    var url = 'https://push2.eastmoney.com/api/qt/stock/get?secid='+idxs[0].s+'&fields=f43,f44,f45,f46,f47,f48,f49,f50,f51,f52,f55,f57,f58,f116,f117,f162,f170,f169,f184&_='+Date.now();
-    var sh = await m.httpGet(url);
+    // 1. 指数行情（带重试）
+    var url = 'https://push2.eastmoney.com/api/qt/stock/get?secid=1.000001&fields=f43,f44,f45,f46,f47,f48,f49,f50,f51,f52,f55,f57,f58,f116,f117,f162,f170,f169,f184&_='+Date.now();
+    var sh = await m.httpGetWithRetry(url, 10000, 2);
     var shChg = (sh&&sh.data&&sh.data.f170)||0;
-    // 2. 全市场成交额分布（取前100只近似评估）
-    var clist = await m.httpGet('https://push2.eastmoney.com/api/qt/clist/get?cb=&fid=f20&po=1&pz=100&pn=1&np=1&fltt=2&invt=2&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f12,f20,f184&_='+Date.now());
+    console.log('[market] shChg:', shChg);
+    // 2. 全市场成交额分布（带重试）
+    var clist = await m.httpGetWithRetry('https://push2.eastmoney.com/api/qt/clist/get?cb=&fid=f20&po=1&pz=100&pn=1&np=1&fltt=2&invt=2&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f12,f20,f184&_='+Date.now(), 10000, 2);
     var items = (clist&&clist.data&&clist.data.diff)||[];
+    // 数据完整性校验 - 少于10只股票不调参
+    if (!items || items.length < 10) {
+      console.log('[market] 数据不足('+(items?items.length:0)+')，跳过调参');
+      return null;
+    }
     var turnovers = items.filter(function(x){return x.f20;}).map(function(x){return x.f20/100000000;});
     turnovers.sort(function(a,b){return a-b;});
     var med = turnovers.length ? (turnovers[Math.floor(turnovers.length/2)]*100000000) : 0;
@@ -160,6 +175,7 @@ m.analyzeMarket = async function() {
       up5:up5, up3:up3, down3:down3, total:items.length,
       timestamp:Date.now()
     };
+    console.log('[market] medTV='+(med/100000000).toFixed(2)+'亿 up5='+up5+' up3='+up3+' down3='+down3);
     return market;
   } catch(e) { console.log('[market] analyze err: '+e.message); return null; }
 };
@@ -173,15 +189,29 @@ m.adjustParams = function(cfg, mkt) {
   var isActive = (mkt.shChg > 1.5 && mkt.up5 > 20) || (mkt.up3 > 50);
   var isDead = mkt.shChg < -1.0 && mkt.down3 > 30;
   var mult = isActive ? 5 : (isDead ? 1.5 : 3);
-  scanner.maxTurnover = Math.round(med * mult);
+  var newMaxTV = Math.round(med * mult);
+  // 护栏：maxTurnover不超过原始值的3倍，不低于原始值的1/3
+  var rawMaxTV = cfg._raw ? cfg._raw.scanner.maxTurnover : (scanner.maxTurnover || 500000);
+  scanner.maxTurnover = Math.max(Math.round(rawMaxTV/3), Math.min(newMaxTV, rawMaxTV*3));
+
   // 动态minTurnover：中位数的20%~50%
   var minMult = (mkt.medTurnover > 1000000000) ? 0.3 : 0.5;
-  scanner.minTurnover = Math.max(3000000, Math.round(med * minMult));
+  var newMinTV = Math.max(3000000, Math.round(med * minMult));
+  // 护栏：minTurnover不超过原始值的2倍，不低于原始值的1/2
+  var rawMinTV = cfg._raw ? cfg._raw.scanner.minTurnover : (scanner.minTurnover || 1000);
+  scanner.minTurnover = Math.max(Math.round(rawMinTV/2), Math.min(newMinTV, rawMinTV*2));
+
   // 动态minPct：上午放量可2%以上，下午缩量可降到1%
   var hour = new Date().getHours();
   var isPM = hour >= 13;
-  scanner.minPct = isPM ? 0.8 : (isDead ? 3 : 1.5);
-  console.log('[adjust] med='+(med/100000000).toFixed(2)+'亿 maxTV='+(scanner.maxTurnover/100000000).toFixed(2)+'亿 minTV='+(scanner.minTurnover/100000000).toFixed(2)+'亿 minPct='+scanner.minPct+'% active='+isActive+' dead='+isDead);
+  var newMinPct = isPM ? 0.8 : (isDead ? 3 : 1.5);
+  // 护栏：minPct不超过原始值的2倍，不低于原始值的一半
+  var rawMinPct = cfg._raw ? cfg._raw.scanner.minPct : (scanner.minPct || 2);
+  scanner.minPct = Math.max(rawMinPct/2, Math.min(newMinPct, rawMinPct*2));
+  // 保证minPct > 0.5% 避免太松
+  scanner.minPct = Math.max(0.5, scanner.minPct);
+
+  console.log('[adjust] med='+(med/100000000).toFixed(2)+'亿 maxTV='+(scanner.maxTurnover/100000000).toFixed(2)+'亿 minTV='+(scanner.minTurnover/100000000).toFixed(2)+'亿 minPct='+scanner.minPct+'% active='+isActive+' dead='+isDead+' [护栏: rawMaxTV='+(rawMaxTV/100000000).toFixed(2)+'亿 rawMinTV='+(rawMinTV/100000000).toFixed(2)+'亿 rawMinPct='+rawMinPct+'%]');
   return cfg;
 };
 
@@ -221,11 +251,14 @@ m.notify = function(analyzed, cfg) {
 };
 
 m.main = async function() {
+  var t0 = Date.now();
   var fs = require('fs');
   var cfgPath = '/sdcard/Download/dy_config.json';
   if (!fs.existsSync(cfgPath)) { console.log('[master] no config'); return; }
   var cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
-  console.log('[master] strategy: '+cfg.strategy.current);
+  // 存储原始参数快照供护栏使用
+  cfg._raw = JSON.parse(JSON.stringify(cfg));
+  console.log('[master] strategy: '+cfg.strategy.current+' rawPct='+cfg._raw.scanner.minPct+' rawTV='+(cfg._raw.scanner.maxTurnover/100000000).toFixed(2)+'亿');
 
   // 熔断检查
   var risk = m.checkRisk();
@@ -241,23 +274,34 @@ m.main = async function() {
 
   // 动态调参 - 根据实时盘面修正筛选参数
   var market = await m.analyzeMarket();
-  cfg = m.adjustParams(cfg, market);
+  if (!market) {
+    console.log('[master] ⚠️ 盘面分析失败，使用固定参数（原始配置）');
+  } else {
+    cfg = m.adjustParams(cfg, market);
+    console.log('[master] ✅ 动态调参生效 scanner: maxTV='+(cfg.scanner.maxTurnover/100000000).toFixed(2)+'亿 minTV='+(cfg.scanner.minTurnover/100000000).toFixed(2)+'亿 minPct='+cfg.scanner.minPct+'%');
+  }
 
   var picks = await m.runScanner(cfg);
-  if (!picks.length) { console.log('[master] no picks'); return; }
+  if (!picks.length) { console.log('[master] no picks, elapsed='+((Date.now()-t0)/1000).toFixed(1)+'s'); return; }
   console.log('[master] picks: '+picks.map(function(p){return p.c;}).join(','));
 
   var analyzed = await m.runDeep(picks, cfg);
   var qualified = analyzed.filter(function(a){return a.sc >= cfg.deep.scoreThreshold;});
   console.log('[master] qualified: '+qualified.length);
 
+  var elapsed = ((Date.now()-t0)/1000).toFixed(1);
   var output = {
-    time: new Date().toISOString(), strategy: cfg.strategy.current,
+    time: new Date().toISOString(),
+    elapsed_sec: parseFloat(elapsed),
+    strategy: cfg.strategy.current,
+    scannerParams: {minPct: cfg.scanner.minPct, minTurnover: cfg.scanner.minTurnover, maxTurnover: cfg.scanner.maxTurnover},
+    market: market || null,
     risk: {level: analyzed.length ? analyzed[0].risk : 'unknown', todayPL: risk.pl, todayLosses: risk.losses},
     picks: qualified.slice(0, 5), all: analyzed
   };
   fs.writeFileSync('/sdcard/Download/dy_result.json', JSON.stringify(output, null, 2));
-  console.log('[master] result -> /sdcard/Download/dy_result.json');
+  console.log('[master] result -> /sdcard/Download/dy_result.json, elapsed='+elapsed+'s');
+  if (elapsed > 120) console.log('[master] ⚠️ 执行超过2分钟，建议检查runDeep效率');
 
   m.notify(qualified, cfg);
 };
