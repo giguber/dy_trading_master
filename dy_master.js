@@ -72,7 +72,7 @@ m.scoreByStrategy = function(s, cfg) {
 };
 
 m.runScanner = async function(cfg) {
-  var url = 'https://push2.eastmoney.com/api/qt/clist/get?cb=&fid=f3&po=1&pz=100&pn=1&np=1&fltt=2&invt=2&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f12,f14,f20,f21,f62,f184,f115,f43,f44,f45,f167,f168,f169,f170,f171&_='+Date.now();
+  var url = 'https://push2.eastmoney.com/api/qt/clist/get?cb=&fid=f3&po=1&pz=200&pn=1&np=1&fltt=2&invt=2&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f12,f14,f20,f21,f62,f184,f115,f43,f44,f45,f167,f168,f169,f170,f171&_='+Date.now();
   var res = await m.httpGet(url);
   if (res.e) { console.log('[scan] err: '+res.e); return []; }
   var items = (res.data && res.data.diff) || [];
@@ -162,10 +162,10 @@ m.analyzeMarket = async function() {
       console.log('[market] 数据不足('+(items?items.length:0)+')，跳过调参');
       return null;
     }
-    var turnovers = items.filter(function(x){return x.f20;}).map(function(x){return x.f20/100000000;});
-    turnovers.sort(function(a,b){return a-b;});
-    var med = turnovers.length ? (turnovers[Math.floor(turnovers.length/2)]*100000000) : 0;
-    var avg = turnovers.length ? (turnovers.reduce(function(s,v){return s+v;},0)/turnovers.length*100000000) : 0;
+    // 个股成交额f20单位为元，直接对原始值排序取中位数（单位：元）
+    var turnovers = items.filter(function(x){return x.f20;}).sort(function(a,b){return a.f20-b.f20;});
+    var med = turnovers.length ? turnovers[Math.floor(turnovers.length/2)].f20 : 0;
+    var avg = turnovers.length ? (turnovers.reduce(function(s,x){return s+x.f20;},0)/turnovers.length) : 0;
     // 3. 涨跌分布
     var up5 = items.filter(function(x){return x.f3&&x.f3>5;}).length;
     var down3 = items.filter(function(x){return x.f3&&x.f3<-3;}).length;
@@ -190,16 +190,14 @@ m.adjustParams = function(cfg, mkt) {
   var isDead = mkt.shChg < -1.0 && mkt.down3 > 30;
   var mult = isActive ? 5 : (isDead ? 1.5 : 3);
   var newMaxTV = Math.round(med * mult);
-  // 护栏：maxTurnover不超过原始值的3倍，不低于原始值的1/3
-  var rawMaxTV = cfg._raw ? cfg._raw.scanner.maxTurnover : (scanner.maxTurnover || 500000);
-  scanner.maxTurnover = Math.max(Math.round(rawMaxTV/3), Math.min(newMaxTV, rawMaxTV*3));
+  // 护栏：maxTurnover以中位数为基准，锁定在 [median×2, median×20] 之间
+  scanner.maxTurnover = Math.max(Math.round(med*2), Math.min(newMaxTV, Math.round(med*20)));
 
   // 动态minTurnover：中位数的20%~50%
   var minMult = (mkt.medTurnover > 1000000000) ? 0.3 : 0.5;
   var newMinTV = Math.max(3000000, Math.round(med * minMult));
-  // 护栏：minTurnover不超过原始值的2倍，不低于原始值的1/2
-  var rawMinTV = cfg._raw ? cfg._raw.scanner.minTurnover : (scanner.minTurnover || 1000);
-  scanner.minTurnover = Math.max(Math.round(rawMinTV/2), Math.min(newMinTV, rawMinTV*2));
+  // 护栏：minTurnover以中位数为基准，锁定在 [median×0.1, median×1] 之间
+  scanner.minTurnover = Math.max(Math.round(med*0.1), Math.min(newMinTV, Math.round(med*1)));
 
   // 动态minPct：上午放量可2%以上，下午缩量可降到1%
   var hour = new Date().getHours();
