@@ -137,6 +137,54 @@ m.runDeep = async function(picks, cfg) {
   return analyzed;
 };
 
+m.analyzeMarket = async function() {
+  try {
+    // 1. 指数行情
+    var idxs = [{n:'sh',s:'1.000001'},{n:'sz',s:'0.399001'},{n:'cy',s:'0.399006'}];
+    var url = 'https://push2.eastmoney.com/api/qt/stock/get?secid='+idxs[0].s+'&fields=f43,f44,f45,f46,f47,f48,f49,f50,f51,f52,f55,f57,f58,f116,f117,f162,f170,f169,f184&_='+Date.now();
+    var sh = await m.httpGet(url);
+    var shChg = (sh&&sh.data&&sh.data.f170)||0;
+    // 2. 全市场成交额分布（取前100只近似评估）
+    var clist = await m.httpGet('https://push2.eastmoney.com/api/qt/clist/get?cb=&fid=f20&po=1&pz=100&pn=1&np=1&fltt=2&invt=2&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f12,f20,f184&_='+Date.now());
+    var items = (clist&&clist.data&&clist.data.diff)||[];
+    var turnovers = items.filter(function(x){return x.f20;}).map(function(x){return x.f20/100000000;});
+    turnovers.sort(function(a,b){return a-b;});
+    var med = turnovers.length ? (turnovers[Math.floor(turnovers.length/2)]*100000000) : 0;
+    var avg = turnovers.length ? (turnovers.reduce(function(s,v){return s+v;},0)/turnovers.length*100000000) : 0;
+    // 3. 涨跌分布
+    var up5 = items.filter(function(x){return x.f3&&x.f3>5;}).length;
+    var down3 = items.filter(function(x){return x.f3&&x.f3<-3;}).length;
+    var up3 = items.filter(function(x){return x.f3&&x.f3>3;}).length;
+    var market = {
+      shChg:shChg, medTurnover:med, avgTurnover:avg,
+      up5:up5, up3:up3, down3:down3, total:items.length,
+      timestamp:Date.now()
+    };
+    return market;
+  } catch(e) { console.log('[market] analyze err: '+e.message); return null; }
+};
+
+m.adjustParams = function(cfg, mkt) {
+  if (!mkt) return cfg;
+  var scanner = cfg.scanner;
+  // 以成交额中位数为锚点
+  var med = mkt.medTurnover || 500000000;
+  // 动态maxTurnover：活跃股成交额上限 = 中位数的3~5倍（保守行情取3倍，活跃行情取5倍）
+  var isActive = (mkt.shChg > 1.5 && mkt.up5 > 20) || (mkt.up3 > 50);
+  var isDead = mkt.shChg < -1.0 && mkt.down3 > 30;
+  var mult = isActive ? 5 : (isDead ? 1.5 : 3);
+  scanner.maxTurnover = Math.round(med * mult);
+  // 动态minTurnover：中位数的20%~50%
+  var minMult = (mkt.medTurnover > 1000000000) ? 0.3 : 0.5;
+  scanner.minTurnover = Math.max(3000000, Math.round(med * minMult));
+  // 动态minPct：上午放量可2%以上，下午缩量可降到1%
+  var hour = new Date().getHours();
+  var isPM = hour >= 13;
+  scanner.minPct = isPM ? 0.8 : (isDead ? 3 : 1.5);
+  console.log('[adjust] med='+(med/100000000).toFixed(2)+'亿 maxTV='+(scanner.maxTurnover/100000000).toFixed(2)+'亿 minTV='+(scanner.minTurnover/100000000).toFixed(2)+'亿 minPct='+scanner.minPct+'% active='+isActive+' dead='+isDead);
+  return cfg;
+};
+
 m.checkRisk = function() {
   try {
     var rf = '/sdcard/Download/.dy_risk.json';
@@ -190,6 +238,10 @@ m.main = async function() {
     console.log('[master] consecutive losses limit hit, skip');
     return;
   }
+
+  // 动态调参 - 根据实时盘面修正筛选参数
+  var market = await m.analyzeMarket();
+  cfg = m.adjustParams(cfg, market);
 
   var picks = await m.runScanner(cfg);
   if (!picks.length) { console.log('[master] no picks'); return; }
