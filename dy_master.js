@@ -132,6 +132,9 @@ m.runDeep = async function(picks, cfg) {
     var pp = Math.max(atr/price*100*2, 5);
     var chg = d.f170!==undefined ? d.f170 : (st.chg||0);
     var sc = 50;
+    // 换手率异常过滤 - 日换手率>25%视为筹码松动，扣20分
+    var turnoverRate = d.f168 || 0;
+    if (turnoverRate > 25) sc -= 20;
     if (atr > 0.5 && atr < 5) sc += 10;
     if (d.f184 && d.f184 > 2) sc += 10;
     if (risk === 'danger') sc -= 30;
@@ -206,10 +209,10 @@ m.adjustParams = function(cfg, mkt) {
   // 护栏：minPct不超过原始值的2倍，不低于原始值的一半
   var rawMinPct = cfg._raw ? cfg._raw.scanner.minPct : (scanner.minPct || 2);
   scanner.minPct = Math.max(rawMinPct/2, Math.min(newMinPct, rawMinPct*2));
-  // 保证minPct > 0.5% 避免太松
-  scanner.minPct = Math.max(0.5, scanner.minPct);
+  // 保证minPct > 1% 避免下午盘太松
+  scanner.minPct = Math.max(1, scanner.minPct);
 
-  console.log('[adjust] med='+(med/100000000).toFixed(2)+'亿 maxTV='+(scanner.maxTurnover/100000000).toFixed(2)+'亿 minTV='+(scanner.minTurnover/100000000).toFixed(2)+'亿 minPct='+scanner.minPct+'% active='+isActive+' dead='+isDead+' [护栏: rawMaxTV='+(rawMaxTV/100000000).toFixed(2)+'亿 rawMinTV='+(rawMinTV/100000000).toFixed(2)+'亿 rawMinPct='+rawMinPct+'%]');
+  console.log('[adjust] med='+(med/100000000).toFixed(2)+'亿 maxTV='+(scanner.maxTurnover/100000000).toFixed(2)+'亿 minTV='+(scanner.minTurnover/100000000).toFixed(2)+'亿 minPct='+scanner.minPct+'% active='+isActive+' dead='+isDead);
   return cfg;
 };
 
@@ -300,6 +303,14 @@ m.main = async function() {
   fs.writeFileSync('/sdcard/Download/dy_result.json', JSON.stringify(output, null, 2));
   console.log('[master] result -> /sdcard/Download/dy_result.json, elapsed='+elapsed+'s');
   if (elapsed > 120) console.log('[master] ⚠️ 执行超过2分钟，建议检查runDeep效率');
+
+  // 分批建仓信号 - 同一天候选≥3只建议分仓
+  if (qualified.length >= 3) {
+    console.log('[master] 🎯 候选≥3只，建议分2~3批介入，单票仓位≤30%');
+    output.batch_signal = {suggest: '分批建仓', reason: '同策略同天出票≥3只', maxPerPosPct: 30};
+  } else if (qualified.length > 0) {
+    output.batch_signal = {suggest: '单票可入', reason: '候选仅'+qualified.length+'只', maxPerPosPct: 50};
+  }
 
   m.notify(qualified, cfg);
 };
